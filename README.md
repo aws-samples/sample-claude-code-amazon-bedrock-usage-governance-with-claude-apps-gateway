@@ -22,7 +22,7 @@ Internal ALB (HTTPS:443, self-signed cert)
    │ default → :8080    │  (Claude Gateway Binary)
    └────────────────────┘
         ↓
-   EC2 Instance (ap-south-1b)
+   EC2 Instance (aws-region)
         ↓
    ┌─────────────────────────────────┐
    │ Claude Gateway (:8080)          │
