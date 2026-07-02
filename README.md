@@ -40,6 +40,8 @@ Internal ALB (HTTPS:443, self-signed cert)
    └─────────────────────────────────┘
 ```
 
+![Architecture](Claudecode_AmazonBedrock_ClaudeAppsGateway.jpg)
+
 ## Key Design Decision: VPN Required
 
 1. Claude Code CLI rejects public ALB URLs (security restriction: "Gateway hosts must be on your organization's private network")
