@@ -1067,4 +1067,13 @@ This section documents every error hit, exact error text, root cause, and the fi
 | Offboarding speed | ⚠️ Manual key revocation | ✅ Remove from IdP group | Gateway: expires within session.ttl_hours (default 1h) |
 | Maintained by | You (self-managed) | Anthropic | Gateway updates ship inside the claude binary |
 | VPN required | ✅ Yes | ✅ Yes (internal ALB) | Both require VPN for private network access |
-| CI/CD / service token support | ✅ Static API keys | ❌ SSO only | Gateway requires inte
+| CI/CD / service token support | ✅ Static API keys | ❌ SSO only | Gateway requires interactive browser login; no service token
+
+
+## Security
+
+See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## License
+
+This library is licensed under the MIT-0 License. See the LICENSE file.
