@@ -1003,6 +1003,11 @@ Access streamlit admin UI at: `https://internal-claude-gateway-internal-alb-xxx.
 
 ---
 
+## Admin Dashboard
+![Admin Dashboard](Dashboard.png)
+![Architecture](Claudecode_AmazonBedrock_ClaudeAppsGateway.jpg)
+![Architecture](Claudecode_AmazonBedrock_ClaudeAppsGateway.jpg)
+
 ## Adding New Models
 
 Model access is controlled entirely in `gateway.yaml`. To change:
