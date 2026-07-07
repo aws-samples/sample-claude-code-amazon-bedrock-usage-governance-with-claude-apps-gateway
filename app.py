@@ -322,7 +322,7 @@ def get_all_spend():
                 "email": actor.get("email_address", ""),
                 "groups": item.get("groups", [])
             }
-        # API returns cents — convert to dollars
+        # API returns cents - convert to dollars
         raw_spend = float(item.get("period_to_date_spend", "0") or "0")
         user_spend[user_id]["periods"][period] = {
             "spend_dollars": raw_spend / 100,
@@ -339,22 +339,51 @@ def get_all_limits():
     return data.get("data", [])
 
 def reset_spend(scope_type, scope_id, period):
-    all_limits = get_all_limits()
-    existing = None
-    for lim in all_limits:
-        scope = lim.get("scope", {})
-        if scope.get("type") == scope_type and lim.get("period") == period:
-            if scope_type == "user" and scope.get("user_id") == scope_id:
-                existing = lim
-                break
-            elif scope_type == "rbac_group" and scope.get("rbac_group_id") == scope_id:
-                existing = lim
-                break
-    if existing:
-        gw_delete(f"/v1/organizations/spend_limits/{existing['id']}")
-        payload = {"scope": existing["scope"], "amount": existing.get("amount"), "period": period}
-        return gw_post("/v1/organizations/spend_limits", payload)
-    return {"error": "No limit found for this scope/period. Set a limit first."}
+    """Reset spend by directly zeroing the spend table in PostgreSQL"""
+    from datetime import datetime, timezone
+    try:
+        conn = get_db()
+        if not conn:
+            return {"error": "Database connection failed"}
+        cur = conn.cursor()
+
+        # Convert period name to actual period format used in DB
+        now = datetime.now(timezone.utc)
+        if period == "monthly":
+            db_period = now.strftime("%Y-%m")           # e.g., 2026-07
+        elif period == "weekly":
+            db_period = now.strftime("%G-W%V")          # e.g., 2026-W27
+        elif period == "daily":
+            db_period = now.strftime("%Y-%m-%d")        # e.g., 2026-07-06
+        else:
+            return {"error": f"Unknown period: {period}"}
+
+        # Check current spend
+        cur.execute("SELECT cents FROM spend WHERE principal = %s AND period = %s", (scope_id, db_period))
+        row = cur.fetchone()
+
+        if row is None:
+            cur.close()
+            conn.close()
+            return {"success": True, "message": f"No spend record for {period} ({db_period}). User has $0.00 usage."}
+
+        current_cents = row[0]
+        if current_cents == 0:
+            cur.close()
+            conn.close()
+            return {"success": True, "message": f"Spend is already $0.00 for {period} ({db_period})."}
+
+        # Reset to zero
+        cur.execute("""
+            UPDATE spend SET cents = 0, updated_at = NOW()
+            WHERE principal = %s AND period = %s
+        """, (scope_id, db_period))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return {"success": True, "message": f"Reset {period} spend from ${current_cents/100:.2f} to $0.00"}
+    except Exception as e:
+        return {"error": f"DB update failed: {str(e)}"}
 
 # ============================================================
 # Display Helpers
@@ -436,14 +465,14 @@ st.title("🛡️ Claude Gateway — Admin Console")
 page = st.sidebar.radio("Navigation", [
     "📊 Dashboard",
     "👥 Users",
-    "📁 Groups",
+    "🔐 Groups",
     "💰 Spend Limits",
     "🔄 Reset Spend",
     "📋 Audit Log"
 ])
 
 # ============================================================
-# PAGE 1: DASHBOARD (Default/First)
+# PAGE 1: DASHBOARD
 # ============================================================
 if page == "📊 Dashboard":
     st.header("Spend Dashboard")
@@ -453,35 +482,18 @@ if page == "📊 Dashboard":
     idc_users = idc_list_users()
     all_limits = get_all_limits()
 
-    # Organization spend by period
-    st.subheader("📈 Organization Spend by Period")
-    period_cols = st.columns(3)
-    for i, period in enumerate(PERIODS):
-        total = sum(d["periods"].get(period, {}).get("spend_dollars", 0.0) for d in spend_data.values())
-        org_cap = None
-        for lim in all_limits:
-            if lim.get("scope", {}).get("type") == "organization" and lim.get("period") == period:
-                org_cap = lim.get("amount")
-                break
-        with period_cols[i]:
-            st.metric(f"{period_emoji(period)} {period.capitalize()} Total", f"${total:.4f}")
-            st.write(f"Org Cap: {cents_to_display(org_cap)}")
-            st.write(usage_bar(calc_usage_pct(total, org_cap)))
-            st.caption(period_reset_info(period))
-
-    st.divider()
-
-    # Summary metrics
+    # Summary metrics (organization limits excluded)
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Active Users", len(spend_data))
     with col2:
         st.metric("IDC Users", len(idc_users))
     with col3:
-        st.metric("Limits Set", len(all_limits))
+        non_org_limits = [l for l in all_limits if l.get("scope", {}).get("type") != "organization"]
+        st.metric("Limits Set", len(non_org_limits))
     with col4:
         pc = {"daily": 0, "weekly": 0, "monthly": 0}
-        for lim in all_limits:
+        for lim in non_org_limits:
             p = lim.get("period", "")
             if p in pc: pc[p] += 1
         st.metric("By Period", f"D:{pc['daily']} W:{pc['weekly']} M:{pc['monthly']}")
@@ -540,7 +552,7 @@ if page == "📊 Dashboard":
         st.success("✅ All users active!")
 
 # ============================================================
-# PAGE 2: USERS (View + Onboard + Remove only — NO limits here)
+# PAGE 2: USERS
 # ============================================================
 elif page == "👥 Users":
     st.header("User Management")
@@ -569,7 +581,6 @@ elif page == "👥 Users":
             memberships = idc_get_user_groups(idc_uid)
             user_groups = [group_id_to_name.get(m.get("GroupId", ""), "?") for m in memberships]
 
-            # Build period data
             if gw_uid and gw_uid in spend_data:
                 periods_data = spend_data[gw_uid].get("periods", {})
                 active = True
@@ -577,7 +588,6 @@ elif page == "👥 Users":
                 periods_data = {"daily": {}, "weekly": {}, "monthly": {}}
                 active = False
 
-            # Merge limits
             effective_uid = gw_uid or idc_uid
             for lim in all_limits:
                 scope = lim.get("scope", {})
@@ -668,9 +678,9 @@ elif page == "👥 Users":
                     st.rerun()
 
 # ============================================================
-# PAGE 3: GROUPS (View + Create + Members + Delete — NO limits here)
+# PAGE 3: GROUPS
 # ============================================================
-elif page == "📁 Groups":
+elif page == "🔐 Groups":
     st.header("Group Management")
     tab1, tab2, tab3, tab4 = st.tabs(["All Groups", "Create", "Members", "Delete"])
 
@@ -699,7 +709,6 @@ elif page == "📁 Groups":
             members = idc_get_group_members(gid)
             g_lims = group_limits.get(gname, {})
 
-            # Aggregate member spend
             group_period_spend = {"daily": 0.0, "weekly": 0.0, "monthly": 0.0}
             for m in members:
                 uid = m.get("MemberId", {}).get("UserId", "")
@@ -713,8 +722,7 @@ elif page == "📁 Groups":
 
             caps_str = " | ".join([f"{period_emoji(p)} {cents_to_display(g_lims.get(p, {}).get('amount'))}" for p in PERIODS])
 
-            with st.expander(f"📁 {gname} | {len(members)} members | {caps_str}"):
-                # Period view
+            with st.expander(f"🔐 {gname} | {len(members)} members | {caps_str}"):
                 gcols = st.columns(3)
                 for pi, period in enumerate(PERIODS):
                     with gcols[pi]:
@@ -728,7 +736,6 @@ elif page == "📁 Groups":
                         st.write(f"Avg: ${avg:.4f}")
                         st.write(usage_bar(pct))
 
-                # Members list
                 if members:
                     st.divider()
                     st.write(f"**Members ({len(members)}):**")
@@ -758,7 +765,7 @@ elif page == "📁 Groups":
                 else:
                     log_audit("CREATE_GROUP", "group", result.get("GroupId", ""), new_name, new_desc)
                     st.success(f"✅ Group `{new_name}` created!")
-                    st.info("💡 Set limits in 💰 Spend Limits tab. Add to gateway.yaml: `groups: [\"{new_name}\"]`")
+                    st.info(f"💡 Set limits in 💰 Spend Limits tab. Add to gateway.yaml: groups: [\"{new_name}\"]")
                     st.rerun()
 
     with tab3:
@@ -823,11 +830,11 @@ elif page == "📁 Groups":
                     st.rerun()
 
 # ============================================================
-# PAGE 4: SPEND LIMITS (SINGLE place to set/view/delete)
+# PAGE 4: SPEND LIMITS (Only Group and User)
 # ============================================================
 elif page == "💰 Spend Limits":
-    st.header("Spend Limits — Single Control Panel")
-    st.info("💡 Resolution order: User override → Most restrictive group → Org default → Unlimited. "
+    st.header("Spend Limits — Control Panel")
+    st.info("💡 Resolution order: User override → Most restrictive group → Unlimited. "
             "You can set all three periods — the tightest one blocks first.")
 
     tab1, tab2, tab3 = st.tabs(["Set Limit", "View All", "Delete"])
@@ -844,14 +851,11 @@ elif page == "💰 Spend Limits":
 
     with tab1:
         st.subheader("Set Limit")
-        scope_type = st.selectbox("Scope", ["🏢 Organization", "📁 Group", "👤 User"])
+        scope_type = st.selectbox("Scope", ["🔐 Group", "👤 User"])
         scope_payload = None
         target_display = ""
 
-        if "Organization" in scope_type:
-            scope_payload = {"type": "organization"}
-            target_display = "Organization"
-        elif "Group" in scope_type:
+        if "Group" in scope_type:
             if idc_groups:
                 grp_names = [g["DisplayName"] for g in idc_groups]
                 sel_grp = st.selectbox("Group", grp_names)
@@ -927,9 +931,7 @@ elif page == "💰 Spend Limits":
                     for lim in all_limits:
                         scope = lim.get("scope", {})
                         match = False
-                        if scope_payload.get("type") == "organization" and scope.get("type") == "organization":
-                            match = True
-                        elif scope_payload.get("type") == "user" and scope.get("user_id") == scope_payload.get("user_id"):
+                        if scope_payload.get("type") == "user" and scope.get("user_id") == scope_payload.get("user_id"):
                             match = True
                         elif scope_payload.get("type") == "rbac_group" and scope.get("rbac_group_id") == scope_payload.get("rbac_group_id"):
                             match = True
@@ -943,12 +945,13 @@ elif page == "💰 Spend Limits":
         st.subheader("All Active Limits")
         if st.button("🔄 Refresh"):
             st.rerun()
-        if all_limits:
+        non_org_limits = [l for l in all_limits if l.get("scope", {}).get("type") != "organization"]
+        if non_org_limits:
             by_scope = {}
-            for lim in all_limits:
+            for lim in non_org_limits:
                 scope = lim.get("scope", {})
                 stype = scope.get("type", "?")
-                target = scope.get("user_id") or scope.get("rbac_group_id") or "organization"
+                target = scope.get("user_id") or scope.get("rbac_group_id") or "unknown"
                 key = f"{stype}:{target}"
                 if key not in by_scope:
                     by_scope[key] = {"type": stype, "target": target, "periods": {}}
@@ -961,7 +964,7 @@ elif page == "💰 Spend Limits":
                 by_scope[key]["periods"][lim.get("period")] = {"amount": lim.get("amount"), "id": lim.get("id")}
 
             for key, data in by_scope.items():
-                icon = {"organization": "🏢", "rbac_group": "📁", "user": "👤"}.get(data["type"], "?")
+                icon = {"rbac_group": "🔐", "user": "👤"}.get(data["type"], "?")
                 period_str = " | ".join([
                     f"{period_emoji(p)} {p}: {cents_to_display(pd.get('amount'))}"
                     for p, pd in sorted(data["periods"].items())
@@ -973,11 +976,12 @@ elif page == "💰 Spend Limits":
 
     with tab3:
         st.subheader("Delete Limit")
-        if all_limits:
+        non_org_limits = [l for l in all_limits if l.get("scope", {}).get("type") != "organization"]
+        if non_org_limits:
             llabels = {}
-            for lim in all_limits:
+            for lim in non_org_limits:
                 scope = lim.get("scope", {})
-                target = scope.get("user_id") or scope.get("rbac_group_id") or "organization"
+                target = scope.get("user_id") or scope.get("rbac_group_id") or "unknown"
                 display = target
                 for gw_id, info in spend_data.items():
                     if gw_id == target:
@@ -998,7 +1002,7 @@ elif page == "💰 Spend Limits":
             st.info("No limits to delete.")
 
 # ============================================================
-# PAGE 5: RESET SPEND (SINGLE place to reset)
+# PAGE 5: RESET SPEND (Only User and Group)
 # ============================================================
 elif page == "🔄 Reset Spend":
     st.header("Reset Spend")
@@ -1039,7 +1043,7 @@ elif page == "🔄 Reset Spend":
                     else:
                         log_audit("RESET_USER_SPEND", "user", uinfo["gw_id"], uinfo["name"],
                                   f"{reset_period}: ${prev_spend:.4f} → $0. Reason: {reason}")
-                        st.success(f"✅ {reset_period} spend reset for {uinfo['name']}!")
+                        st.success(f"✅ {result.get('message', 'Spend reset!')}")
                         st.rerun()
         else:
             st.info("No active users to reset.")
@@ -1081,7 +1085,7 @@ elif page == "🔄 Reset Spend":
                     else:
                         log_audit("RESET_GROUP_SPEND", "group", sel_grp, sel_grp,
                                   f"{reset_period} reset. Reason: {reason}")
-                        st.success(f"✅ {reset_period} spend reset for group `{sel_grp}`!")
+                        st.success(f"✅ {result.get('message', 'Spend reset!')}")
                         st.rerun()
         else:
             st.info("No groups with limits to reset. Set group limits first in 💰 Spend Limits.")
@@ -1109,7 +1113,7 @@ elif page == "📋 Audit Log":
             ts = log["timestamp"][:19].replace("T", " ")
             action = log["action"]
             icon = {"SET_LIMIT": "💰", "RESET_USER_SPEND": "🔄", "RESET_GROUP_SPEND": "🔄",
-                    "CREATE_USER": "👤", "DELETE_USER": "🗑️", "CREATE_GROUP": "📁",
+                    "CREATE_USER": "👤", "DELETE_USER": "🗑️", "CREATE_GROUP": "🔐",
                     "DELETE_GROUP": "🗑️", "ADD_TO_GROUP": "➕", "REMOVE_FROM_GROUP": "➖",
                     "BLOCK": "🚫", "REMOVE_LIMITS": "♾️", "DELETE_LIMIT": "🗑️"}.get(action, "📝")
             st.write(f"`{ts}` {icon} **{action}** → {log['target_type']}: {log['target_name']}")
